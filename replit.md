@@ -1,45 +1,49 @@
-# [Project name]
+# Dashboard de Recaudación Tributaria
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Dashboard interactivo en Streamlit para visualizar y analizar la recaudación tributaria argentina.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `streamlit run artifacts/streamlit-dashboard/app.py --server.port 8000` — iniciar el dashboard
+- El workflow `Dashboard Recaudación` inicia automáticamente el dashboard en el puerto 8000
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11 + Streamlit 1.57
+- Pandas para procesamiento de datos
+- Plotly para gráficos interactivos
+- OpenPyXL para lectura del Excel
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/streamlit-dashboard/app.py` — aplicación principal del dashboard
+- `artifacts/streamlit-dashboard/.streamlit/config.toml` — configuración del servidor Streamlit
+- `attached_assets/Recaudación_2023_hasta_2026_Nominal_y_Real_1778714645756.xlsx` — fuente de datos
 
-## Architecture decisions
+## Estructura del Excel
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- **Nominal**: recaudación en valores corrientes
+- **Real**: recaudación ajustada por inflación (base 2023)
+- **Variación Nominal / Real**: calculadas dinámicamente desde los datos base
+- Fila 9 (Excel): fechas (columna C en adelante, mensual desde ene-2023)
+- Columna B: nombres de los impuestos
+
+## Secciones del Dashboard
+
+1. **Visor del Último Mes**: KPIs de variación, torta de composición, tabla resumen
+2. **Análisis Histórico**: serie temporal con medias móviles 3M y 6M, variaciones mensual e interanual
+3. **Proyecciones**: placeholder para auto-ARIMA (próxima etapa)
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
-
-## User preferences
-
-_Populate as you build — explicit user instructions worth remembering across sessions._
+Dashboard de recaudación tributaria para uso interno de la oficina. Permite:
+- Ver la composición de la recaudación del último mes disponible
+- Analizar la evolución histórica por impuesto (Nominal o Real)
+- Visualizar variaciones mensuales e interanuales
+- Seleccionar período de análisis: 6 meses, 1 año, 2 años o histórico
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Los datos se cargan con `@st.cache_data` — si se actualiza el Excel, reiniciar el servidor o usar `st.cache_data.clear()`
+- Las variaciones de los sheets "Variación Nominal" y "Variación Real" del Excel contienen fórmulas no evaluadas; se recalculan desde los datos base
+- El Excel debe estar en `attached_assets/` relativo a la raíz del workspace
