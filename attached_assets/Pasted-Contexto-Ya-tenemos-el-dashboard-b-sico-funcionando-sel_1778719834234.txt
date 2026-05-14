@@ -1,0 +1,79 @@
+Contexto: Ya tenemos el dashboard básico funcionando (selector de impuestos, gráfico histórico, media móvil). Ahora quiero agregar análisis predictivo siguiendo tres etapas secuenciales. No rompas la funcionalidad actual; agregá nuevas pestañas.
+
+ETAPA 1 – AUTO‑ARIMA SIMPLE (Pestaña "Pronóstico simple")
+Para el impuesto seleccionado (incluí también una opción "Recaudación Total" que sume todos los impuestos principales), entrená un modelo auto_arima de pmdarima usando solo la serie histórica de recaudación.
+
+Usá seasonal=True, m=12 (si hay al menos 24 meses de datos, si no, seasonal=False). Mostrá un spinner mientras entrena.
+
+Generá proyección a 6 meses y mostrá un gráfico con:
+
+Histórico (línea continua)
+
+Pronóstico (línea punteada)
+
+Debajo del gráfico, mostrá las métricas:
+
+AIC, BIC, MAPE, RMSE
+
+Test de Ljung‑Box sobre residuos (p‑value)
+
+ETAPA 2 – PROYECCIÓN INDIVIDUAL DE CADA VARIABLE MACRO (Nueva pestaña: "Pronóstico macro")
+Usá el archivo Excel Datos macro modelo reca.xlsx que ya subí (está reorganizado, 100% claro).
+
+Para cada una de estas cuatro variables:
+
+Inflación (IPC)
+
+EMAE
+
+Tipo de cambio (dólar oficial venta)
+
+Tasa de interés (depósitos 30 días)
+
+Hacé:
+
+Agrupación mensual (si es diaria: tomar último valor del mes).
+Entrená un auto_arima individual (solo con la historia de esa macro).
+Generá proyección a 6 meses para esa macro.
+Mostrá un subplot o gráfico individual (histórico + pronóstico) para cada una.
+El objetivo de esta pestaña es tener valores futuros (6 meses) de las cuatro macro, que luego usaremos en la etapa 3.
+
+ETAPA 3 – MODELO CON VARIABLES EXÓGENAS (Nueva pestaña: "Modelo con macro")
+Usá las mismas proyecciones macro que generaste en la Etapa 2 (inflación, tipo de cambio, EMAE). No repitas el último valor: usá los pronósticos de los modelos macro individuales.
+
+Alineá las fechas: el histórico de recaudación + histórico de macro (mismos meses). Para los meses futuros, tomá los valores proyectados de cada macro (6 meses).
+
+Entrená un auto_arima con exógenas (parámetro X en pmdarima) donde:
+
+y = recaudación del impuesto seleccionado (o total)
+
+X = matriz con las tres macro (inflación, tc, emae) – durante el entrenamiento se usan los valores históricos reales de esas macro.
+
+Generá pronóstico a 6 meses para la recaudación usando los valores futuros de las macro (los que obtuviste en la Etapa 2).
+
+En el mismo gráfico, compará:
+
+Pronóstico del modelo simple (Etapa 1)
+
+Pronóstico del modelo con exógenas (esta etapa)
+
+Mostrá:
+
+MAPE de ambos modelos (calculado con validación dentro de muestra, por ejemplo dejando los últimos 3 meses reales como test).
+
+Mejora porcentual del MAPE del modelo con macro respecto al simple.
+
+Agregá una nota aclaratoria: "Las proyecciones de las variables macro se obtienen de modelos ARIMA individuales. El modelo con exógenas incorpora esos pronósticos para mejorar la predicción de la recaudación."
+
+Requisitos técnicos:
+
+Usá streamlit, plotly, pmdarima, statsmodels, pandas, seaborn.
+
+Asegurate de instalar todas las dependencias en requirements.txt.
+
+Cuidá los try/except por si alguna macro tiene pocos datos históricos.
+
+No modifiques las pestañas originales (solo agregá las nuevas).
+
+Gracias. Espero tu respuesta para continuar.
+
