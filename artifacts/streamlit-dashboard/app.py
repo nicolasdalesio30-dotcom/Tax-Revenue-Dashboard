@@ -943,7 +943,7 @@ def render_modelo_con_macro(datos: dict, tipo_recaudacion: str, impuesto: str) -
         if s_alin.isna().sum() > len(s_alin) * 0.5:
             st.warning(f"La macro {key} tiene demasiados valores faltantes en el rango alineado. Se omite.")
             continue
-        s_alin = s_alin.fillna(method="ffill").fillna(method="bfill")
+        s_alin = s_alin.ffill().bfill()
         X_hist_dict[key] = s_alin.values.tolist()
 
     if not X_hist_dict:
