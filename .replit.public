@@ -1,0 +1,8 @@
+run = "streamlit run artifacts/streamlit-dashboard/app.py --server.port 8000 --server.headless true"
+
+[deployment]
+run = ["streamlit", "run", "artifacts/streamlit-dashboard/app.py", "--server.port", "8000", "--server.headless", "true"]
+
+[[ports]]
+localPort = 8000
+externalPort = 8000

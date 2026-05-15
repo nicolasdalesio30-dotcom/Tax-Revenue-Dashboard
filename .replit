@@ -4,6 +4,8 @@ modules = ["nodejs-24", "python-3.11"]
 router = "application"
 deploymentTarget = "autoscale"
 
+run = "streamlit run artifacts/streamlit-dashboard/app.py --server.port 8000 --server.headless true"
+
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
 env = { "CI" = "true" }
@@ -88,3 +90,5 @@ externalPort = 3001
 [nix]
 channel = "stable-25_05"
 packages = ["glibcLocales"]
+
+run = "streamlit run app.py"
