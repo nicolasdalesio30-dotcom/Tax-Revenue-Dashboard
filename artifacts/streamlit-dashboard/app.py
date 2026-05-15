@@ -1,26 +1,35 @@
 """
 Dashboard de Recaudación Tributaria
-====================================
-Dashboard interactivo para análisis y proyección de la recaudación tributaria argentina.
+=====================================
+Herramienta permanente de análisis y proyección para la oficina.
 
-Módulos auxiliares:
-    loader.py   — carga de datos (recaudación, macro, REM BCRA)
-    forecast.py — modelos ARIMA, métricas y scoring
-    ai_tools.py — resumen IA del Boletín Oficial + sentimiento macro
+Módulos:
+    loader.py             — carga de datos (recaudación, macro, REM BCRA)
+    forecast.py           — modelos ARIMA, métricas, scoring, transparencia
+    tests_estadisticos.py — Kruskal-Wallis + Chow, pre-tests para ARIMA
+    ai_tools.py           — scraping web real + Claude (BOA, sentimiento)
 """
 
+import hashlib
+import io
 import warnings
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from loader   import (cargar_datos, cargar_datos_macro, cargar_rem,
-                      proyectar_real_con_rem, COMPONENTES_TORTA, TAX_ROW_INDEX)
-from forecast import (pronosticar_serie_cache, pronosticar_macro_cache,
-                      pronosticar_con_exogenas_cache, generar_fechas_futuras,
-                      render_metricas_completas, calcular_mape, calcular_rmse)
+from loader import (
+    cargar_datos, cargar_datos_macro, cargar_rem,
+    proyectar_real_con_rem, COMPONENTES_TORTA, TAX_ROW_INDEX,
+)
+from forecast import (
+    pronosticar_serie_cache, pronosticar_macro_cache,
+    pronosticar_con_exogenas_cache, generar_fechas_futuras,
+    render_metricas_completas, render_backend_modelo,
+    calcular_mape, calcular_rmse,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -29,23 +38,25 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Recaudación Tributaria",
-    page_icon="📊",
-    layout="wide",
+    page_icon="📊", layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ---------------------------------------------------------------------------
-# HELPERS — MESES EN ESPAÑOL Y FORMATEO
+# HELPERS — MESES EN ESPAÑOL
 # ---------------------------------------------------------------------------
 
-MESES_CORTOS = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",
-                7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
-MESES_LARGOS = {1:"Enero",2:"Febrero",3:"Marzo",4:"Abril",5:"Mayo",6:"Junio",
-                7:"Julio",8:"Agosto",9:"Septiembre",10:"Octubre",11:"Noviembre",12:"Diciembre"}
+MESES_CORTOS = {
+    1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",
+    7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic",
+}
+MESES_LARGOS = {
+    1:"Enero",2:"Febrero",3:"Marzo",4:"Abril",5:"Mayo",6:"Junio",
+    7:"Julio",8:"Agosto",9:"Septiembre",10:"Octubre",11:"Noviembre",12:"Diciembre",
+}
 
 
 def fmt_mes(dt) -> str:
-    """'May 2026' → 'May. 2026' en español."""
     return f"{MESES_CORTOS[dt.month]} {dt.year}"
 
 
@@ -53,8 +64,7 @@ def fmt_mes_largo(dt) -> str:
     return f"{MESES_LARGOS[dt.month]} {dt.year}"
 
 
-def eje_x_espanol(fig: go.Figure, fechas, axis: str = "xaxis") -> go.Figure:
-    """Aplica etiquetas de meses en español al eje X de un gráfico Plotly."""
+def eje_x_espanol(fig, fechas, axis="xaxis"):
     fechas = list(fechas)
     fig.update_layout(**{axis: dict(
         tickvals=fechas,
@@ -64,36 +74,42 @@ def eje_x_espanol(fig: go.Figure, fechas, axis: str = "xaxis") -> go.Figure:
     return fig
 
 
-def formatear_millones(v: float) -> str:
+def formatear_millones(v):
     if pd.isna(v): return "—"
     if abs(v) >= 1_000_000: return f"${v/1_000_000:,.1f}B"
     return f"${v:,.0f}M"
 
 
-def formatear_pct(v: float, decimales: int = 1) -> str:
+def formatear_pct(v, decimales=1):
     if pd.isna(v): return "—"
     signo = "+" if v >= 0 else ""
     return f"{signo}{v*100:.{decimales}f}%"
 
 
 # ---------------------------------------------------------------------------
-# GRÁFICOS — con meses en español
+# GRÁFICOS
 # ---------------------------------------------------------------------------
 
+COLOR_HIST  = "#1f77b4"
+COLOR_FC_S  = "#ff7f0e"
+COLOR_FC_M  = "#2ca02c"
 PALETA_TORTA = px.colors.qualitative.Set3
-COLOR_HIST   = "#1f77b4"
-COLOR_FC_S   = "#ff7f0e"
-COLOR_FC_M   = "#2ca02c"
+
+CONFIG_MACRO = {
+    "IPC":   dict(label="IPC (Inflación mensual)", unidad="Índice", color="#e377c2"),
+    "Dolar": dict(label="Tipo de Cambio — Dólar Oficial", unidad="$/USD", color="#bcbd22"),
+    "Tasa":  dict(label="Tasa de Interés (depósitos 30d)", unidad="TNA (%)", color="#17becf"),
+    "EMAE":  dict(label="EMAE (Actividad Económica)", unidad="Índice", color="#8c564b"),
+}
 
 
 def grafico_serie_temporal(serie, nombre, tipo, periodo):
-    """Línea histórica + medias móviles 3M y 6M con meses en español."""
     def _filt(s):
         df = s.to_frame()
         ult = df.index.max()
-        offsets = {"6 meses": 5, "1 año": 11, "2 años": 23}
-        if periodo in offsets:
-            df = df[df.index >= ult - pd.DateOffset(months=offsets[periodo])]
+        offs = {"6 meses": 5, "1 año": 11, "2 años": 23}
+        if periodo in offs:
+            df = df[df.index >= ult - pd.DateOffset(months=offs[periodo])]
         return df.iloc[:, 0]
 
     sf  = _filt(serie)
@@ -105,23 +121,22 @@ def grafico_serie_temporal(serie, nombre, tipo, periodo):
         name=nombre, line=dict(color=COLOR_HIST, width=2.5), marker=dict(size=5),
         hovertemplate="<b>%{x|}</b><br>%{y:,.0f} M$<extra></extra>"))
     fig.add_trace(go.Scatter(x=mm3.index, y=mm3.values, mode="lines",
-        name="MM 3m", line=dict(color="#ff7f0e", width=2, dash="dot"),
-        hovertemplate="<b>%{x|}</b><br>MM3: %{y:,.0f} M$<extra></extra>"))
+        name="MM 3m", line=dict(color="#ff7f0e", width=2, dash="dot")))
     fig.add_trace(go.Scatter(x=mm6.index, y=mm6.values, mode="lines",
-        name="MM 6m", line=dict(color="#2ca02c", width=2, dash="dash"),
-        hovertemplate="<b>%{x|}</b><br>MM6: %{y:,.0f} M$<extra></extra>"))
+        name="MM 6m", line=dict(color="#2ca02c", width=2, dash="dash")))
     fig.update_layout(
-        title=f"{nombre} — {tipo} ({periodo})",
-        xaxis_title="Mes", yaxis_title="Millones de $",
+        title=f"{nombre} — {tipo} ({periodo})", xaxis_title="Mes",
+        yaxis_title="Millones de $", hovermode="x unified", height=430,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified", height=430, margin=dict(t=60, b=50, l=60, r=20))
+        margin=dict(t=60, b=50, l=60, r=20))
     eje_x_espanol(fig, sf.index)
     return fig
 
 
-def grafico_barras_variacion(data: pd.Series, titulo: str, ylabel: str) -> go.Figure:
+def grafico_barras_variacion(data, titulo, ylabel):
     colores = ["#2ca02c" if v >= 0 else "#d62728" for v in data.values]
-    fig = go.Figure(go.Bar(x=data.index, y=data.values * 100, marker_color=colores,
+    fig = go.Figure(go.Bar(
+        x=data.index, y=data.values * 100, marker_color=colores,
         hovertemplate="<b>%{x|}</b><br>%{y:.1f}%<extra></extra>"))
     fig.add_hline(y=0, line_width=1, line_color="black")
     fig.update_layout(title=titulo, xaxis_title="Mes", yaxis_title=ylabel,
@@ -131,28 +146,22 @@ def grafico_barras_variacion(data: pd.Series, titulo: str, ylabel: str) -> go.Fi
 
 
 def grafico_torta(fila_mes, tipo, fecha):
-    """
-    Torta de composición. Solo muestra % dentro del slice;
-    etiquetas completas van a la leyenda lateral.
-    """
     vals, labs = [], []
     for comp in COMPONENTES_TORTA:
         v = fila_mes.get(comp, np.nan)
         if pd.notna(v) and v > 0:
             vals.append(v)
             labs.append(comp)
-
     fig = go.Figure(go.Pie(
         labels=labs, values=vals, hole=0.38,
-        marker=dict(colors=PALETA_TORTA),
-        textinfo="percent", texttemplate="%{percent:.1%}",
-        insidetextorientation="radial", automargin=True,
+        marker=dict(colors=PALETA_TORTA), textinfo="percent",
+        texttemplate="%{percent:.1%}", insidetextorientation="radial",
         hovertemplate="<b>%{label}</b><br>%{value:,.0f} M$<br>%{percent:.1%}<extra></extra>",
     ))
     fig.update_layout(
         title=f"Composición — {tipo} — {fmt_mes_largo(fecha)}",
         height=520, margin=dict(t=60, b=20, l=20, r=200),
-        legend=dict(orientation="v", x=1.02, y=0.5, font=dict(size=12), title="Impuesto"),
+        legend=dict(orientation="v", x=1.02, y=0.5, font=dict(size=12)),
         uniformtext=dict(minsize=10, mode="hide"),
     )
     return fig
@@ -161,131 +170,153 @@ def grafico_torta(fila_mes, tipo, fecha):
 def grafico_pronostico(serie_hist, fechas_fut, forecast, ci_lower, ci_upper,
                         titulo, nombre_serie="Histórico", nombre_fc="Pronóstico",
                         color_hist=COLOR_HIST, color_fc=COLOR_FC_S, n_hist=24):
-    """Histórico + banda IC 80% + pronóstico en un único gráfico."""
     hist = serie_hist.dropna().tail(n_hist)
     fc   = np.array(forecast)
     lo   = np.array(ci_lower)
     hi   = np.array(ci_upper)
 
-    # Color hex → RGB para la banda semitransparente
     def _hex_rgb(h): return int(h[1:3],16), int(h[3:5],16), int(h[5:7],16)
     r, g, b = _hex_rgb(color_fc)
 
     fig = go.Figure()
-
-    # Histórico
     fig.add_trace(go.Scatter(x=hist.index, y=hist.values, mode="lines+markers",
         name=nombre_serie, line=dict(color=color_hist, width=2.5), marker=dict(size=5),
         hovertemplate="<b>%{x|}</b><br>%{y:,.1f}<extra></extra>"))
-
-    # Banda IC 80%
     fig.add_trace(go.Scatter(
         x=list(fechas_fut) + list(fechas_fut[::-1]),
         y=list(hi) + list(lo[::-1]),
         fill="toself", fillcolor=f"rgba({r},{g},{b},0.18)",
         line=dict(color="rgba(0,0,0,0)"), name="IC 80%", hoverinfo="skip"))
-
-    # Pronóstico
     fig.add_trace(go.Scatter(x=fechas_fut, y=fc, mode="lines+markers",
         name=nombre_fc, line=dict(color=color_fc, width=2.5, dash="dash"),
         marker=dict(size=7, symbol="diamond"),
         hovertemplate="<b>%{x|}</b><br>%{y:,.1f}<extra></extra>"))
-
-    # Línea vertical fin del histórico
     fig.add_vline(x=str(serie_hist.dropna().index.max()), line_dash="dot",
                   line_color="gray", line_width=1)
-
     fig.update_layout(
         title=titulo, xaxis_title="Mes", yaxis_title="Valor",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified", height=430, margin=dict(t=70, b=50, l=60, r=20))
-
-    todas_fechas = list(hist.index) + list(fechas_fut)
-    eje_x_espanol(fig, todas_fechas)
+    eje_x_espanol(fig, list(hist.index) + list(fechas_fut))
     return fig
 
 
-def grafico_heatmap_correlacion(df_macro: dict, serie_tax: pd.Series,
-                                 nombre_tax: str, max_lag: int = 4) -> go.Figure:
-    """
-    Heatmap de correlación de Pearson entre cada variable macro y el impuesto,
-    a diferentes rezagos (lag 0 … lag_max meses).
-    """
+def grafico_heatmap_correlacion(macro_dict, serie_tax, nombre_tax, max_lag=4):
     nombres_col = [f"Lag {i}m" for i in range(max_lag + 1)]
     filas = {}
-
-    for nombre_macro, serie_macro in df_macro.items():
-        if serie_macro is None or serie_macro.empty:
-            continue
+    for nombre_macro, serie_macro in macro_dict.items():
+        if serie_macro is None or serie_macro.empty: continue
         corrs = []
         for lag in range(max_lag + 1):
             x = serie_macro.shift(lag)
-            alineado = pd.concat([serie_tax, x], axis=1).dropna()
-            if len(alineado) >= 8:
-                c = float(alineado.iloc[:, 0].corr(alineado.iloc[:, 1]))
-            else:
-                c = np.nan
-            corrs.append(round(c, 3) if not np.isnan(c) else np.nan)
+            alin = pd.concat([serie_tax, x], axis=1).dropna()
+            corrs.append(round(float(alin.iloc[:,0].corr(alin.iloc[:,1])), 3)
+                         if len(alin) >= 8 else np.nan)
         filas[nombre_macro] = corrs
 
-    if not filas:
-        return go.Figure()
-
+    if not filas: return go.Figure()
     df_corr = pd.DataFrame(filas, index=nombres_col).T
-
     fig = go.Figure(go.Heatmap(
-        z=df_corr.values,
-        x=df_corr.columns.tolist(),
-        y=df_corr.index.tolist(),
+        z=df_corr.values, x=df_corr.columns.tolist(), y=df_corr.index.tolist(),
         colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-        text=[[f"{v:.2f}" if not np.isnan(v) else "—" for v in row]
-              for row in df_corr.values],
+        text=[[f"{v:.2f}" if not np.isnan(v) else "—" for v in row] for row in df_corr.values],
         texttemplate="%{text}",
-        hovertemplate="<b>%{y}</b> × %{x}<br>Correlación: %{z:.3f}<extra></extra>",
+        hovertemplate="<b>%{y}</b> × %{x}<br>ρ = %{z:.3f}<extra></extra>",
         colorbar=dict(title="ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
     ))
     fig.update_layout(
         title=f"Correlación de Pearson: Variables Macro × {nombre_tax}",
         xaxis_title="Rezago (meses)", yaxis_title="Variable Macro",
-        height=320, margin=dict(t=60, b=40, l=140, r=40),
+        height=330, margin=dict(t=60, b=40, l=150, r=40),
     )
     return fig
 
 
 # ---------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR — Controles + Carga de archivos
 # ---------------------------------------------------------------------------
 
 def render_sidebar(datos: dict) -> tuple:
     st.sidebar.title("⚙️ Controles")
     st.sidebar.markdown("---")
 
-    tipo = st.sidebar.radio(
-        "Tipo de recaudación",
-        options=["Nominal", "Real"],
-        help="Nominal: valores corrientes. Real: deflactados por IPC (base 2023). "
-             "Los meses sin IPC disponible se proyectan usando el REM del BCRA.",
-    )
-
+    tipo = st.sidebar.radio("Tipo de recaudación", ["Nominal", "Real"],
+        help="Real: deflactado por IPC base 2023. Meses sin IPC proyectados con REM.")
     opciones = list(TAX_ROW_INDEX.keys())
     impuesto = st.sidebar.selectbox(
-        "Impuesto",
-        options=opciones,
-        index=opciones.index("TOTAL REC. TRIBUTARIOS"),
-        help="Se aplica a todas las pestañas de análisis y pronóstico.",
-    )
-
-    st.sidebar.markdown("---")
+        "Impuesto", options=opciones,
+        index=opciones.index("TOTAL REC. TRIBUTARIOS"))
     periodo = st.sidebar.radio(
-        "Período histórico",
-        options=["6 meses", "1 año", "2 años", "Histórico"],
-        index=1,
+        "Período histórico", ["6 meses", "1 año", "2 años", "Histórico"], index=1)
+
+    # --- Carga de archivos ---
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📂 Actualizar datos")
+    st.sidebar.caption(
+        "Subí nuevos Excels con el mismo formato para actualizar la base. "
+        "El sistema detecta automáticamente el cambio y limpia el caché."
     )
 
-    st.sidebar.markdown("---")
-    st.sidebar.caption(
-        "Fuente: datos de oficina. Valores en millones de pesos corrientes o constantes."
-    )
+    with st.sidebar.expander("📤 Subir nuevos archivos"):
+        up_reca  = st.file_uploader(
+            "Excel recaudación (.xlsx)", type=["xlsx"], key="up_reca",
+            help="Mismo formato que el archivo original: sheets Nominal y Real, "
+                 "fila 9 con fechas, columna B con nombres de impuestos."
+        )
+        up_macro = st.file_uploader(
+            "Excel macro (.xlsx)", type=["xlsx"], key="up_macro",
+            help="Sheets: IPC, Dolar oficial, Tasa de interes, EMAE."
+        )
+        up_rem   = st.file_uploader(
+            "REM BCRA (.xlsx)", type=["xlsx"], key="up_rem",
+            help="Excel histórico del REM del BCRA. "
+                 "Si no subís nada, se descarga automáticamente del BCRA."
+        )
+
+        if st.button("✅ Aplicar archivos nuevos", type="primary"):
+            actualizado = False
+            if up_reca is not None:
+                b = up_reca.read()
+                h = hashlib.md5(b).hexdigest()
+                if st.session_state.get("reca_hash") != h:
+                    st.session_state["reca_bytes"] = b
+                    st.session_state["reca_hash"]  = h
+                    actualizado = True
+
+            if up_macro is not None:
+                b = up_macro.read()
+                h = hashlib.md5(b).hexdigest()
+                if st.session_state.get("macro_hash") != h:
+                    st.session_state["macro_bytes"] = b
+                    st.session_state["macro_hash"]  = h
+                    actualizado = True
+
+            if up_rem is not None:
+                b = up_rem.read()
+                h = hashlib.md5(b).hexdigest()
+                if st.session_state.get("rem_hash") != h:
+                    st.session_state["rem_bytes"] = b
+                    st.session_state["rem_hash"]  = h
+                    actualizado = True
+
+            if actualizado:
+                st.cache_data.clear()
+                st.success("✅ Datos actualizados. Recargando…")
+                st.rerun()
+            else:
+                st.info("No se detectaron cambios en los archivos.")
+
+        # Estado actual de los datos cargados
+        st.markdown("---")
+        fuente_reca  = "📤 Subido" if "reca_bytes"  in st.session_state else "💾 Disco"
+        fuente_macro = "📤 Subido" if "macro_bytes" in st.session_state else "💾 Disco"
+        fuente_rem   = "📤 Subido" if "rem_bytes"   in st.session_state else "🌐 BCRA"
+        st.caption(
+            f"**Recaudación:** {fuente_reca} | "
+            f"**Macro:** {fuente_macro} | "
+            f"**REM:** {fuente_rem}"
+        )
+
     return tipo, impuesto, periodo
 
 
@@ -293,7 +324,7 @@ def render_sidebar(datos: dict) -> tuple:
 # TAB 1 — Visor del Último Mes
 # ---------------------------------------------------------------------------
 
-def render_ultimo_mes(datos: dict, tipo: str) -> None:
+def render_ultimo_mes(datos, tipo):
     df    = datos[tipo]
     df_vm = datos[f"Var {tipo}"]
     df_ia = datos[f"IA {tipo}"]
@@ -306,13 +337,12 @@ def render_ultimo_mes(datos: dict, tipo: str) -> None:
 
     st.subheader(f"📅 Último mes disponible: **{fmt_mes_largo(ult_mes)}**")
 
-    # --- IPC / inflación ---
-    macro = cargar_datos_macro()
+    macro = cargar_datos_macro(st.session_state.get("macro_bytes"))
     ipc   = macro.get("IPC", pd.Series(dtype=float)).dropna()
     ipc_vm = ipc.pct_change()
     ult_ipc_mes = ipc.index.max()
-    inflacion_mensual = ipc_vm.iloc[-1] if not ipc_vm.empty else np.nan
-    inflacion_ia      = ipc.pct_change(12).iloc[-1] if len(ipc) >= 12 else np.nan
+    inflacion_mensual = float(ipc_vm.iloc[-1]) if not ipc_vm.empty else np.nan
+    inflacion_ia      = float(ipc.pct_change(12).iloc[-1]) if len(ipc) >= 12 else np.nan
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Recaudación Total",    formatear_millones(total))
@@ -320,29 +350,21 @@ def render_ultimo_mes(datos: dict, tipo: str) -> None:
               delta=formatear_pct(vm_tot), delta_color="normal")
     c3.metric("Var. interanual",      formatear_pct(ia_tot),
               delta=formatear_pct(ia_tot), delta_color="normal")
-
-    # "¿Cuánto dio la inflación?"
     c4.metric(
-        f"Inflación mensual ({fmt_mes(ult_ipc_mes)})",
+        f"🔥 Inflación mensual ({fmt_mes(ult_ipc_mes)})",
         formatear_pct(inflacion_mensual),
-        delta=formatear_pct(inflacion_mensual),
-        delta_color="inverse",
-        help="Variación mensual del IPC INDEC. Dato más reciente disponible.",
+        delta=formatear_pct(inflacion_mensual), delta_color="inverse",
+        help="Variación mensual del IPC INDEC. 'Cuánto dio la inflación' el último mes.",
     )
     c5.metric(
         "Inflación interanual",
         formatear_pct(inflacion_ia),
-        delta=formatear_pct(inflacion_ia),
-        delta_color="inverse",
-        help="Variación del IPC respecto al mismo mes del año anterior.",
+        delta=formatear_pct(inflacion_ia), delta_color="inverse",
     )
 
     st.markdown("---")
-
-    # --- Torta ---
     st.plotly_chart(grafico_torta(fila_mes, tipo, ult_mes), width="stretch")
 
-    # --- Tabla resumen ---
     st.subheader("Resumen por impuesto")
     rows = []
     for nombre in TAX_ROW_INDEX:
@@ -362,113 +384,121 @@ def render_ultimo_mes(datos: dict, tipo: str) -> None:
 # TAB 2 — Análisis Histórico
 # ---------------------------------------------------------------------------
 
-def render_historico(datos: dict, tipo: str, impuesto: str, periodo: str,
-                     rem_serie: pd.Series, ipc_serie: pd.Series,
-                     info_proyec: dict) -> None:
+def render_historico(datos, tipo, impuesto, periodo, rem_serie, ipc_serie, info_proyec):
     df    = datos[tipo]
     df_vm = datos[f"Var {tipo}"]
     df_ia = datos[f"IA {tipo}"]
 
     st.subheader(f"📈 {impuesto} — {tipo}")
 
-    # Si hay meses proyectados y el tipo es Real, mostrar aviso
     if tipo == "Real" and info_proyec:
         meses_proy = [fmt_mes_largo(m) for m in sorted(info_proyec.keys())]
-        tasas_str  = ", ".join(f"{t:.1f}%" for t in
-                               [info_proyec[m] for m in sorted(info_proyec.keys())])
+        tasas_str  = ", ".join(
+            f"{info_proyec[m]:.1f}%" for m in sorted(info_proyec.keys())
+        )
         st.info(
-            f"📌 Los datos reales de **{', '.join(meses_proy)}** se estimaron con inflación "
-            f"proyectada del REM (BCRA): **{tasas_str} mensual** respectivamente.",
+            f"📌 Los datos reales de **{', '.join(meses_proy)}** se estimaron "
+            f"con inflación proyectada del REM (BCRA): **{tasas_str} mensual** "
+            f"respectivamente.",
             icon="📌",
         )
 
-    # Gráfico serie temporal + medias móviles
     st.plotly_chart(
         grafico_serie_temporal(df[impuesto], impuesto, tipo, periodo),
         width="stretch",
     )
 
-    # Tabla últimos 6 meses + mini KPIs
     col_t, col_k = st.columns([2, 3])
     with col_t:
         st.markdown("**Últimos 6 meses**")
         sd = df[impuesto].dropna().tail(6)
-        tabla = pd.DataFrame({
+        st.dataframe(pd.DataFrame({
             "Mes": [fmt_mes_largo(f) for f in sd.index],
             "Recaudación (M$)": [f"{v:,.0f}" for v in sd.values],
-        })
-        st.dataframe(tabla, width="stretch", hide_index=True)
+        }), width="stretch", hide_index=True)
 
     with col_k:
         sd_full = df[impuesto].dropna()
         if len(sd_full) >= 2:
             ult, ant = sd_full.iloc[-1], sd_full.iloc[-2]
-            vm_k     = (ult / ant - 1) if ant else np.nan
-            ia_k     = df_ia[impuesto].dropna()
-            ia_v     = ia_k.iloc[-1] if not ia_k.empty else np.nan
+            vm_k = (ult / ant - 1) if ant else np.nan
+            ia_k = df_ia[impuesto].dropna()
+            ia_v = ia_k.iloc[-1] if not ia_k.empty else np.nan
             st.markdown("**Indicadores del último mes**")
             k1, k2 = st.columns(2)
-            k1.metric("Último valor",     formatear_millones(ult))
-            k2.metric("Var. mensual",     formatear_pct(vm_k),
-                      delta=formatear_pct(vm_k))
+            k1.metric("Último valor",    formatear_millones(ult))
+            k2.metric("Var. mensual",    formatear_pct(vm_k), delta=formatear_pct(vm_k))
             k3, k4 = st.columns(2)
-            k3.metric("Var. interanual",  formatear_pct(ia_v),
-                      delta=formatear_pct(ia_v))
+            k3.metric("Var. interanual", formatear_pct(ia_v), delta=formatear_pct(ia_v))
             k4.metric("Máximo histórico", formatear_millones(sd_full.max()))
 
     st.markdown("---")
-
     c1, c2 = st.columns(2)
-    with c1:
-        def _filt(s):
-            df2 = s.dropna().to_frame()
-            ult = df2.index.max()
-            offs = {"6 meses": 5, "1 año": 11, "2 años": 23}
-            if periodo in offs:
-                df2 = df2[df2.index >= ult - pd.DateOffset(months=offs[periodo])]
-            return df2.iloc[:, 0]
 
-        data_vm = _filt(df_vm[impuesto])
+    def _filt(s):
+        df2 = s.dropna().to_frame()
+        ult = df2.index.max()
+        offs = {"6 meses": 5, "1 año": 11, "2 años": 23}
+        if periodo in offs:
+            df2 = df2[df2.index >= ult - pd.DateOffset(months=offs[periodo])]
+        return df2.iloc[:, 0]
+
+    with c1:
         st.plotly_chart(
-            grafico_barras_variacion(data_vm, f"Variación mensual — {impuesto}", "Var. (%)"),
+            grafico_barras_variacion(_filt(df_vm[impuesto]),
+                                     f"Variación mensual — {impuesto}", "Var. (%)"),
             width="stretch")
     with c2:
-        data_ia = _filt(df_ia[impuesto])
         st.plotly_chart(
-            grafico_barras_variacion(data_ia, f"Variación interanual — {impuesto}", "Var. i.a. (%)"),
+            grafico_barras_variacion(_filt(df_ia[impuesto]),
+                                     f"Variación interanual — {impuesto}", "Var. i.a. (%)"),
             width="stretch")
 
 
 # ---------------------------------------------------------------------------
-# TAB 3 — Pronóstico Simple
+# TAB 3 — Pronóstico Simple (con pre-tests)
 # ---------------------------------------------------------------------------
 
-def render_pronostico_simple(datos: dict, tipo: str, impuesto: str,
-                              rem_serie: pd.Series, fecha_rem) -> None:
+def render_pronostico_simple(datos, tipo, impuesto, rem_serie, fecha_rem, df_rem_ui):
     st.subheader(f"🔮 Pronóstico Simple — {impuesto} ({tipo})")
     st.caption(
-        "Modelo **Auto-ARIMA estacional (m=12)** entrenado solo con la serie histórica. "
-        "Intervalo de confianza al 80%. Validación: últimos 3 meses como test."
+        "**Auto-ARIMA estacional (m=12)** entrenado solo con la serie histórica. "
+        "IC al 80%. Validación en los últimos 3 meses."
     )
 
-    df     = datos[tipo]
-    serie  = df[impuesto].dropna()
-    horiz  = 6
+    df    = datos[tipo]
+    serie = df[impuesto].dropna()
+    horiz = 6
 
-    # Mostrar si se usa REM para el IPC
+    # --- Pre-tests ---
+    from tests_estadisticos import render_pretests
+    config_tests = render_pretests(serie, impuesto)
+    seasonal     = config_tests["seasonal"]
+    m_arima      = config_tests["m"]
+    fecha_inicio = config_tests["fecha_inicio"]
+    fi_iso       = fecha_inicio.strftime("%Y-%m-%d") if fecha_inicio else None
+
+    st.markdown("---")
+
+    # --- REM info ---
     if not rem_serie.empty and fecha_rem is not None:
-        st.info(
-            f"📊 Las expectativas de inflación del REM (BCRA) al "
-            f"**{fmt_mes_largo(fecha_rem)}** se usan como referencia adicional "
-            f"para contextualizar el pronóstico de la serie real.",
-            icon="📊",
-        )
+        with st.expander(
+            f"📊 REM BCRA — Inflación esperada (corte: {fecha_rem.strftime('%b %Y')})"
+        ):
+            st.caption(
+                "Medianas del Relevamiento de Expectativas de Mercado del BCRA. "
+                "Estos valores se usan para proyectar la serie Real en meses sin IPC."
+            )
+            if not df_rem_ui.empty:
+                st.dataframe(df_rem_ui.tail(12), hide_index=True, width="stretch")
 
+    # --- Entrenar modelo ---
     with st.spinner("⏳ Entrenando Auto-ARIMA…"):
         res = pronosticar_serie_cache(
             vals=tuple(serie.values.tolist()),
             fechas_iso=tuple(serie.index.strftime("%Y-%m-%d").tolist()),
-            horizonte=horiz, seasonal=True, m=12,
+            horizonte=horiz, seasonal=seasonal, m=m_arima,
+            fecha_inicio_iso=fi_iso,
         )
 
     if "error" in res:
@@ -486,7 +516,7 @@ def render_pronostico_simple(datos: dict, tipo: str, impuesto: str,
         width="stretch",
     )
 
-    # Tabla de valores proyectados
+    # Tabla valores proyectados
     df_fc = pd.DataFrame({
         "Mes":             [fmt_mes_largo(f) for f in fechas_fut],
         "Pronóstico (M$)": [f"{v:,.0f}" for v in res["forecast"]],
@@ -497,40 +527,32 @@ def render_pronostico_simple(datos: dict, tipo: str, impuesto: str,
     st.dataframe(df_fc, hide_index=True)
 
     st.markdown("---")
-    render_metricas_completas(res, float(serie.mean()),
-                               titulo="📊 Métricas del modelo")
+    render_metricas_completas(res, float(serie.mean()), titulo="📊 Métricas del modelo")
+
+    # Backend del modelo
+    render_backend_modelo(
+        serie=serie, res=res, fechas_fut=fechas_fut,
+        config_pretests=config_tests, nombre=impuesto,
+    )
 
 
 # ---------------------------------------------------------------------------
 # TAB 4 — Pronóstico Macro
 # ---------------------------------------------------------------------------
 
-CONFIG_MACRO = {
-    "IPC":   dict(label="IPC (Inflación mensual)", unidad="Índice", color="#e377c2"),
-    "Dolar": dict(label="Tipo de Cambio — Dólar Oficial", unidad="$/USD", color="#bcbd22"),
-    "Tasa":  dict(label="Tasa de Interés (depósitos 30d)", unidad="TNA (%)", color="#17becf"),
-    "EMAE":  dict(label="EMAE (Actividad Económica)", unidad="Índice", color="#8c564b"),
-}
-
-
-def render_pronostico_macro() -> dict:
-    """
-    Muestra grilla 2×2 con histórico + pronóstico a 6 meses para cada macro.
-    Incluye análisis de sentimiento de mercado vía IA.
-    Retorna dict {nombre_macro: pd.Series de pronóstico futuro}.
-    """
+def render_pronostico_macro():
     st.subheader("📉 Proyección de Variables Macroeconómicas")
     st.caption(
         "Modelos **Auto-ARIMA** independientes para IPC, Dólar, Tasa y EMAE. "
         "Los pronósticos futuros se usan como exógenas en el Modelo con Macro."
     )
 
-    macro = cargar_datos_macro()
-    horiz = 6
-    resultados = {}
-    pron_futuros = {}
+    macro  = cargar_datos_macro(st.session_state.get("macro_bytes"))
+    horiz  = 6
+    pron_f = {}
 
     with st.spinner("⏳ Entrenando modelos ARIMA para las 4 variables…"):
+        resultados = {}
         for key in CONFIG_MACRO:
             serie = macro.get(key, pd.Series(dtype=float)).dropna()
             if serie.empty:
@@ -543,10 +565,9 @@ def render_pronostico_macro() -> dict:
             )
             resultados[key] = res
             if "error" not in res:
-                fechas_fut = generar_fechas_futuras(serie.index.max(), horiz)
-                pron_futuros[key] = pd.Series(res["forecast"], index=fechas_fut)
+                ff = generar_fechas_futuras(serie.index.max(), horiz)
+                pron_f[key] = pd.Series(res["forecast"], index=ff)
 
-    # --- Grilla 2×2 de gráficos ---
     keys = list(CONFIG_MACRO.keys())
     for i in range(0, len(keys), 2):
         cols = st.columns(2)
@@ -570,12 +591,7 @@ def render_pronostico_macro() -> dict:
                 fig.update_layout(yaxis_title=cfg["unidad"], height=370)
                 st.plotly_chart(fig, width="stretch")
 
-                # Variación del último mes
-                if len(serie) >= 2:
-                    var_ult = serie.iloc[-1] / serie.iloc[-2] - 1
-                else:
-                    var_ult = np.nan
-
+                var_ult = float(serie.iloc[-1]/serie.iloc[-2] - 1) if len(serie) >= 2 else np.nan
                 m1, m2, m3 = st.columns(3)
                 m1.metric("AIC",    f"{res['aic']:.1f}" if not np.isnan(res["aic"]) else "—")
                 m2.metric("Orden",  res.get("orden", "—"))
@@ -583,50 +599,65 @@ def render_pronostico_macro() -> dict:
                           delta=formatear_pct(var_ult),
                           delta_color="inverse" if key in ("IPC","Dolar","Tasa") else "normal")
 
-                # Sentimiento de IA (expandible)
-                with st.expander(f"🧠 Análisis de sentimiento — {cfg['label']}"):
-                    mes_ult  = serie.index.max()
-                    with st.spinner("Consultando IA…"):
+                with st.expander(f"🧠 Sentimiento de mercado — {cfg['label']}"):
+                    mes_ult = serie.index.max()
+                    with st.spinner("Buscando noticias y analizando…"):
                         from ai_tools import analizar_sentimiento_macro
-                        sent = analizar_sentimiento_macro(
+                        sent_data = analizar_sentimiento_macro(
                             variable=key,
                             mes=mes_ult.month, anio=mes_ult.year,
                             ultimo_valor=float(serie.iloc[-1]),
-                            variacion_pct=float(var_ult) * 100 if not np.isnan(var_ult) else np.nan,
+                            variacion_pct=var_ult * 100 if not np.isnan(var_ult) else np.nan,
                         )
-                    st.markdown(sent)
+                    st.markdown(sent_data["resumen"])
+                    if sent_data.get("fuentes"):
+                        st.markdown("**Fuentes consultadas:**")
+                        for f in sent_data["fuentes"][:4]:
+                            url  = f.get("url","")
+                            title = f.get("title","Sin título")
+                            date  = f.get("date","")
+                            st.markdown(
+                                f"- [{title}]({url})"
+                                + (f" — {date}" if date else ""),
+                                unsafe_allow_html=False,
+                            )
 
     st.markdown("---")
-    st.success(
-        "✅ Pronósticos macro listos. Pasá a **Modelo con Macro** para la proyección integrada."
-    )
-    return pron_futuros
+    st.success("✅ Pronósticos macro listos. Pasá a **Modelo con Macro** para la proyección integrada.")
+    return pron_f
 
 
 # ---------------------------------------------------------------------------
 # TAB 5 — Modelo con Macro (ARIMAX)
 # ---------------------------------------------------------------------------
 
-def render_modelo_con_macro(datos: dict, tipo: str, impuesto: str) -> None:
+def render_modelo_con_macro(datos, tipo, impuesto):
     st.subheader("🧠 Modelo con Variables Macroeconómicas")
     st.info(
-        "Las proyecciones de las variables macro se obtienen de modelos ARIMA individuales. "
-        "El modelo con exógenas incorpora estos pronósticos para mejorar la predicción "
-        "de la recaudación.",
+        "ARIMAX: el modelo incorpora las proyecciones de macro como variables explicativas. "
+        "Los pre-tests determinan si se usa estacionalidad y qué rango temporal se entrena.",
         icon="ℹ️",
     )
 
     df    = datos[tipo]
     y     = df[impuesto].dropna()
-    macro = cargar_datos_macro()
+    macro = cargar_datos_macro(st.session_state.get("macro_bytes"))
     horiz = 6
 
-    macro_disp = {k: v.dropna() for k, v in macro.items()
-                  if v is not None and not v.empty}
+    macro_disp = {k: v.dropna() for k, v in macro.items() if v is not None and not v.empty}
 
-    fecha_inicio = max(y.index.min(), *[s.index.min() for s in macro_disp.values()])
-    fecha_fin    = min(y.index.max(), *[s.index.max() for s in macro_disp.values()])
-    y_alin       = y[(y.index >= fecha_inicio) & (y.index <= fecha_fin)]
+    fecha_inicio_all = max(y.index.min(), *[s.index.min() for s in macro_disp.values()])
+    fecha_fin_all    = min(y.index.max(), *[s.index.max() for s in macro_disp.values()])
+    y_alin = y[(y.index >= fecha_inicio_all) & (y.index <= fecha_fin_all)]
+
+    # --- Pre-tests en pestaña de macro ---
+    from tests_estadisticos import render_pretests
+    config_tests = render_pretests(y_alin, f"{impuesto}_macro")
+    seasonal     = config_tests["seasonal"]
+    fecha_inicio = config_tests["fecha_inicio"]
+    fi_iso       = fecha_inicio.strftime("%Y-%m-%d") if fecha_inicio else None
+
+    st.markdown("---")
 
     X_hist_dict = {}
     for key, serie in macro_disp.items():
@@ -634,16 +665,11 @@ def render_modelo_con_macro(datos: dict, tipo: str, impuesto: str) -> None:
         if s.isna().sum() < len(s) * 0.5:
             X_hist_dict[key] = s.values.tolist()
 
-    if not X_hist_dict:
-        st.error("No hay macros disponibles para alinear.")
-        return
-
-    # Pronósticos futuros de las macros
+    # Pronósticos macro para el futuro
     X_fut_dict = {}
     with st.spinner("⏳ Computando pronósticos macro…"):
         for key, serie in macro_disp.items():
-            if key not in X_hist_dict:
-                continue
+            if key not in X_hist_dict: continue
             rm = pronosticar_macro_cache(
                 vals=tuple(serie.values.tolist()),
                 fechas_iso=tuple(serie.index.strftime("%Y-%m-%d").tolist()),
@@ -656,62 +682,56 @@ def render_modelo_con_macro(datos: dict, tipo: str, impuesto: str) -> None:
     X_h = {k: X_hist_dict[k] for k in macros_comunes}
     X_f = {k: X_fut_dict[k]  for k in macros_comunes}
 
-    # Modelo simple (referencia)
+    # Modelos
     with st.spinner("⏳ Entrenando modelo simple (referencia)…"):
         res_s = pronosticar_serie_cache(
             vals=tuple(y_alin.values.tolist()),
             fechas_iso=tuple(y_alin.index.strftime("%Y-%m-%d").tolist()),
-            horizonte=horiz, seasonal=True, m=12,
+            horizonte=horiz, seasonal=seasonal, m=12 if seasonal else 1,
+            fecha_inicio_iso=fi_iso,
         )
 
-    # Modelo con exógenas
     with st.spinner("⏳ Entrenando ARIMAX con macros…"):
         res_m = pronosticar_con_exogenas_cache(
             y_vals=tuple(y_alin.values.tolist()),
             y_fechas=tuple(y_alin.index.strftime("%Y-%m-%d").tolist()),
-            X_hist_dict=X_h, X_fut_dict=X_f, horizonte=horiz,
+            X_hist_dict=X_h, X_fut_dict=X_f,
+            horizonte=horiz, fecha_inicio_iso=fi_iso,
         )
 
     if "error" in res_m or "error" in res_s:
-        st.error(f"Error en el modelo: {res_m.get('error','')}{res_s.get('error','')}")
+        st.error(f"Error: {res_m.get('error','')} {res_s.get('error','')}")
         return
 
-    fechas_fut = generar_fechas_futuras(y_alin.index.max(), horiz)
+    fechas_fut  = generar_fechas_futuras(y_alin.index.max(), horiz)
+    hist_plot   = y_alin.tail(24)
 
     # --- Gráfico comparativo ---
-    hist_plot = y_alin.tail(24)
     fig = go.Figure()
-
     fig.add_trace(go.Scatter(x=hist_plot.index, y=hist_plot.values,
         mode="lines+markers", name="Histórico",
-        line=dict(color=COLOR_HIST, width=2.5), marker=dict(size=5),
-        hovertemplate="<b>%{x|}</b><br>%{y:,.0f} M$<extra></extra>"))
+        line=dict(color=COLOR_HIST, width=2.5), marker=dict(size=5)))
 
-    # IC simple
     fig.add_trace(go.Scatter(
-        x=list(fechas_fut) + list(fechas_fut[::-1]),
-        y=res_s["ci_upper"] + res_s["ci_lower"][::-1],
-        fill="toself", fillcolor="rgba(255,127,14,0.15)",
-        line=dict(color="rgba(0,0,0,0)"), name="IC Simple (80%)", hoverinfo="skip"))
-
+        x=list(fechas_fut)+list(fechas_fut[::-1]),
+        y=res_s["ci_upper"]+res_s["ci_lower"][::-1],
+        fill="toself", fillcolor="rgba(255,127,14,0.12)",
+        line=dict(color="rgba(0,0,0,0)"), name="IC Simple 80%", hoverinfo="skip"))
     fig.add_trace(go.Scatter(x=fechas_fut, y=res_s["forecast"],
         mode="lines+markers", name="Simple (ARIMA)",
         line=dict(color=COLOR_FC_S, width=2.5, dash="dash"),
-        marker=dict(size=7, symbol="diamond"),
-        hovertemplate="<b>%{x|}</b><br>%{y:,.0f} M$<extra></extra>"))
+        marker=dict(size=7, symbol="diamond")))
 
-    # IC macro
     fig.add_trace(go.Scatter(
-        x=list(fechas_fut) + list(fechas_fut[::-1]),
-        y=res_m["ci_upper"] + res_m["ci_lower"][::-1],
-        fill="toself", fillcolor="rgba(44,160,44,0.15)",
-        line=dict(color="rgba(0,0,0,0)"), name="IC Macro (80%)", hoverinfo="skip"))
-
+        x=list(fechas_fut)+list(fechas_fut[::-1]),
+        y=res_m["ci_upper"]+res_m["ci_lower"][::-1],
+        fill="toself", fillcolor="rgba(44,160,44,0.12)",
+        line=dict(color="rgba(0,0,0,0)"), name="IC Macro 80%", hoverinfo="skip"))
     fig.add_trace(go.Scatter(x=fechas_fut, y=res_m["forecast"],
-        mode="lines+markers", name=f"Con Macro ({', '.join(macros_comunes)})",
+        mode="lines+markers",
+        name=f"Con Macro ({', '.join(macros_comunes)})",
         line=dict(color=COLOR_FC_M, width=2.5, dash="dot"),
-        marker=dict(size=7, symbol="circle"),
-        hovertemplate="<b>%{x|}</b><br>%{y:,.0f} M$<extra></extra>"))
+        marker=dict(size=7)))
 
     fig.add_vline(x=str(y_alin.index.max()), line_dash="dot",
                   line_color="gray", line_width=1)
@@ -719,113 +739,142 @@ def render_modelo_con_macro(datos: dict, tipo: str, impuesto: str) -> None:
         title=f"{impuesto} — Simple vs. ARIMAX (IC 80%)",
         xaxis_title="Mes", yaxis_title="Millones de $",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified", height=490, margin=dict(t=80, b=50, l=60, r=20))
+        hovermode="x unified", height=500, margin=dict(t=80, b=50, l=60, r=20))
     eje_x_espanol(fig, list(hist_plot.index) + list(fechas_fut))
     st.plotly_chart(fig, width="stretch")
 
-    # --- Tabla comparativa ---
+    # Tabla comparativa
     st.markdown("**Valores proyectados mes a mes**")
     df_cmp = pd.DataFrame({
-        "Mes":           [fmt_mes_largo(f) for f in fechas_fut],
-        "Simple (M$)":   [f"{v:,.0f}" for v in res_s["forecast"]],
-        "Con Macro (M$)":[f"{v:,.0f}" for v in res_m["forecast"]],
-        "Diferencia":    [f"{(m-s):+,.0f}" for s, m in
-                          zip(res_s["forecast"], res_m["forecast"])],
+        "Mes":            [fmt_mes_largo(f) for f in fechas_fut],
+        "Simple (M$)":    [f"{v:,.0f}" for v in res_s["forecast"]],
+        "Con Macro (M$)": [f"{v:,.0f}" for v in res_m["forecast"]],
+        "Diferencia":     [f"{(m-s):+,.0f}" for s, m in
+                           zip(res_s["forecast"], res_m["forecast"])],
     })
     st.dataframe(df_cmp, hide_index=True)
 
     st.markdown("---")
 
-    # --- Heatmap de correlación ---
-    st.markdown("**📊 Correlación de Pearson entre variables macro y el impuesto seleccionado**")
+    # Heatmap correlaciones
+    st.markdown("**📊 Correlación de Pearson: Variables Macro × Impuesto**")
     fig_hm = grafico_heatmap_correlacion(macro_disp, y_alin, impuesto, max_lag=4)
     st.plotly_chart(fig_hm, width="stretch")
     st.caption(
-        "Lag 0m: correlación contemporánea. Lag Nm: la macro desplazada N meses predice "
-        "la recaudación actual. Valores > 0.5 o < -0.5 indican relación significativa."
+        "Lag 0m: contemporánea. Lag Nm: la macro desplazada N meses anticipa la recaudación. "
+        "|ρ| > 0.5 indica relación relevante."
     )
 
     st.markdown("---")
 
-    # --- Métricas comparativas ---
-    st.markdown("**Comparación de métricas (validación en últimos 3 meses)**")
+    # Métricas comparativas
     media_y = float(y_alin.mean())
-
     col_s, col_m = st.columns(2)
     with col_s:
         render_metricas_completas(res_s, media_y, titulo="Modelo Simple")
     with col_m:
         render_metricas_completas(res_m, media_y, titulo="Modelo con Macro")
 
-    # Mejora MAPE
     mape_s = res_s.get("mape", np.nan)
     mape_m = res_m.get("mape", np.nan)
     if not np.isnan(mape_s) and not np.isnan(mape_m) and mape_s != 0:
         mejora = (mape_s - mape_m) / mape_s * 100
         color  = "#1a7f37" if mejora > 0 else "#cf222e"
         st.markdown(
-            f"**Mejora MAPE del modelo con macro vs. simple:** "
+            f"**Mejora MAPE (macro vs. simple):** "
             f'<span style="color:{color};font-weight:700">{mejora:+.1f}%</span>',
             unsafe_allow_html=True,
         )
 
-    with st.expander("ℹ️ Variables exógenas utilizadas"):
-        st.markdown(
-            "| Variable | Descripción |\n|---|---|\n"
-            + "\n".join(
-                f"| **{k}** | {CONFIG_MACRO[k]['label']} |"
-                for k in macros_comunes
-            )
-        )
-        st.markdown(
-            f"**Período de entrenamiento:** "
-            f"{fmt_mes_largo(y_alin.index.min())} → {fmt_mes_largo(y_alin.index.max())} "
-            f"({len(y_alin)} obs.)"
-        )
+    # Backend del modelo
+    render_backend_modelo(
+        serie=y_alin, res=res_m, fechas_fut=fechas_fut,
+        config_pretests=config_tests, nombre=f"{impuesto}_macro",
+    )
 
 
 # ---------------------------------------------------------------------------
-# TAB 6 — Boletín Oficial + IA
+# TAB 6 — Boletín Oficial + IA (scraping real)
 # ---------------------------------------------------------------------------
 
-def render_boletin_oficial(impuesto: str) -> None:
+def render_boletin_oficial(impuesto):
     st.subheader("📰 Boletín Oficial y Novedades del Impuesto")
     st.caption(
-        "Generá un resumen de las publicaciones del Boletín Oficial de la República Argentina "
-        "y noticias financieras relevantes para el impuesto seleccionado en el período indicado."
+        "Busca noticias reales en sitios financieros argentinos (Infobae, Ámbito, Cronista, "
+        "AFIP, etc.) mediante scraping web en tiempo real. No usa el conocimiento del modelo — "
+        "todo el contenido proviene de fuentes encontradas en el momento de la búsqueda."
+    )
+
+    st.info(
+        "🌐 **Fuentes en tiempo real**: el sistema busca en la web y descarga el contenido "
+        "de los artículos antes de resumirlos. Cuanto más reciente sea el período elegido, "
+        "más probable es encontrar cobertura.",
+        icon="🌐",
     )
 
     col_f1, col_f2 = st.columns(2)
     with col_f1:
-        mes_sel  = st.selectbox("Mes",
-            options=list(range(1, 13)),
-            format_func=lambda m: MESES_LARGOS[m],
-            index=0,
+        mes_sel = st.selectbox(
+            "Mes", options=list(range(1, 13)),
+            format_func=lambda m: MESES_LARGOS[m], index=0,
+            key="boletin_mes",
         )
     with col_f2:
-        anio_sel = st.selectbox("Año",
-            options=list(range(2023, 2027)),
-            index=2,
+        anio_sel = st.selectbox(
+            "Año", options=list(range(2023, 2027)), index=2,
+            key="boletin_anio",
         )
 
-    if st.button("🔍 Buscar y resumir", type="primary"):
+    if st.button("🔍 Buscar y resumir en tiempo real", type="primary"):
         with st.spinner(
             f"Buscando publicaciones sobre **{impuesto}** en "
-            f"**{MESES_LARGOS[mes_sel]} {anio_sel}**…"
+            f"**{MESES_LARGOS[mes_sel]} {anio_sel}**… "
+            f"(puede tardar 20-40 seg.)"
         ):
-            from ai_tools import resumir_boletin_oficial
-            resumen = resumir_boletin_oficial(
+            from ai_tools import resumir_boletin_con_ia
+            resultado = resumir_boletin_con_ia(
                 impuesto=impuesto, mes=mes_sel, anio=anio_sel,
             )
 
         st.markdown("---")
+        n_f = resultado.get("n_fuentes", 0)
+        if n_f == 0:
+            st.warning(
+                "⚠️ No se encontraron artículos específicos para este impuesto/período. "
+                "El resumen puede ser más genérico."
+            )
+        else:
+            st.success(
+                f"✅ Se consultaron **{n_f} fuentes web** "
+                f"(búsqueda realizada el {resultado.get('fecha_busqueda','')})"
+            )
+
         st.markdown(
-            f"### Resumen — {impuesto} | {MESES_LARGOS[mes_sel]} {anio_sel}"
+            f"### Resumen — {impuesto} | "
+            f"{MESES_LARGOS[mes_sel]} {anio_sel}"
         )
-        st.markdown(resumen)
+        st.markdown(resultado["resumen"])
+
+        # Fuentes
+        fuentes = resultado.get("fuentes", [])
+        if fuentes:
+            st.markdown("---")
+            st.markdown("**📎 Fuentes consultadas:**")
+            for f in fuentes:
+                url   = f.get("url", "")
+                title = f.get("title", "Sin título")
+                date  = f.get("date", "")
+                if url:
+                    st.markdown(
+                        f"- [{title}]({url})"
+                        + (f" — {date}" if date else "")
+                    )
+                else:
+                    st.markdown(f"- {title}")
+
         st.markdown("---")
         st.markdown(
-            "🔗 **Verificar publicaciones directamente:** "
+            "🔗 **Verificar publicaciones directamente en el BOA:** "
             "[boletinoficial.gob.ar](https://www.boletinoficial.gob.ar/busquedaAvanzada)"
         )
 
@@ -837,29 +886,32 @@ def render_boletin_oficial(impuesto: str) -> None:
 def main() -> None:
     st.title("📊 Dashboard de Recaudación Tributaria")
     st.caption(
-        "Análisis y proyección de la recaudación tributaria argentina. "
-        "Fuente: datos internos de la oficina. Valores en millones de pesos."
+        "Herramienta de análisis y proyección para la oficina. "
+        "Subí nuevos Excels desde el panel lateral para actualizar todos los datos."
     )
 
-    # --- Carga de datos ---
-    datos     = cargar_datos()
-    rem_serie, fecha_rem = cargar_rem()
-    macro     = cargar_datos_macro()
-    ipc_serie = macro.get("IPC", pd.Series(dtype=float)).dropna()
+    # Carga de datos (con soporte para archivos subidos)
+    reca_bytes  = st.session_state.get("reca_bytes")
+    macro_bytes = st.session_state.get("macro_bytes")
+    rem_bytes   = st.session_state.get("rem_bytes")
 
-    # --- Extensión de la serie Real con REM ---
+    datos                = cargar_datos(reca_bytes)
+    macro                = cargar_datos_macro(macro_bytes)
+    rem_serie, fecha_rem, df_rem_ui = cargar_rem(rem_bytes)
+    ipc_serie            = macro.get("IPC", pd.Series(dtype=float)).dropna()
+
+    # Extensión serie Real con REM
     df_real_ext, info_proyec = proyectar_real_con_rem(
         datos["Nominal"], datos["Real"], ipc_serie, rem_serie,
     )
-    datos["Real"] = df_real_ext
-    # Recalcular variaciones con la serie extendida
-    datos["Var Real"] = df_real_ext.pct_change()
-    datos["IA Real"]  = df_real_ext.pct_change(12)
+    datos["Real"]      = df_real_ext
+    datos["Var Real"]  = df_real_ext.pct_change()
+    datos["IA Real"]   = df_real_ext.pct_change(12)
 
-    # --- Sidebar ---
+    # Sidebar
     tipo, impuesto, periodo = render_sidebar(datos)
 
-    # --- Tabs ---
+    # Tabs
     (tab_mes, tab_hist, tab_simple,
      tab_macro, tab_exog, tab_boletin) = st.tabs([
         "📅 Último Mes",
@@ -872,20 +924,14 @@ def main() -> None:
 
     with tab_mes:
         render_ultimo_mes(datos, tipo)
-
     with tab_hist:
-        render_historico(datos, tipo, impuesto, periodo,
-                         rem_serie, ipc_serie, info_proyec)
-
+        render_historico(datos, tipo, impuesto, periodo, rem_serie, ipc_serie, info_proyec)
     with tab_simple:
-        render_pronostico_simple(datos, tipo, impuesto, rem_serie, fecha_rem)
-
+        render_pronostico_simple(datos, tipo, impuesto, rem_serie, fecha_rem, df_rem_ui)
     with tab_macro:
         render_pronostico_macro()
-
     with tab_exog:
         render_modelo_con_macro(datos, tipo, impuesto)
-
     with tab_boletin:
         render_boletin_oficial(impuesto)
 
