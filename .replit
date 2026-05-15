@@ -1,12 +1,10 @@
-run = "streamlit run artifacts/streamlit-dashboard/app.py --server.port 8000 --server.headless true"
-
 modules = ["nodejs-24", "python-3.11"]
 
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
-
 run = "streamlit run artifacts/streamlit-dashboard/app.py --server.port 8000 --server.headless true"
+
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
