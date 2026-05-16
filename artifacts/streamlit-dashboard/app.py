@@ -205,16 +205,29 @@ def grafico_heatmap_correlacion(macro_dict, serie_tax, nombre_tax, max_lag=4):
     nombres_col = [f"Lag {i}m" for i in range(max_lag + 1)]
     filas = {}
     for nombre_macro, serie_macro in macro_dict.items():
-        if serie_macro is None or serie_macro.empty: continue
+        if serie_macro is None or serie_macro.empty:
+            continue
+        # Alinear índices con la serie del impuesto
+        common_idx = serie_tax.index.intersection(serie_macro.index)
+        if len(common_idx) < 8:
+            continue  # pocos datos, no se puede calcular
+        serie_macro_alin = serie_macro.reindex(common_idx)
+        serie_tax_alin = serie_tax.reindex(common_idx)
         corrs = []
         for lag in range(max_lag + 1):
-            x = serie_macro.shift(lag)
-            alin = pd.concat([serie_tax, x], axis=1).dropna()
-            corrs.append(round(float(alin.iloc[:,0].corr(alin.iloc[:,1])), 3)
-                         if len(alin) >= 8 else np.nan)
+            x = serie_macro_alin.shift(lag)
+            alin = pd.concat([serie_tax_alin, x], axis=1).dropna()
+            if len(alin) >= 8:
+                corrs.append(round(float(alin.iloc[:,0].corr(alin.iloc[:,1])), 3))
+            else:
+                corrs.append(np.nan)
         filas[nombre_macro] = corrs
 
-    if not filas: return go.Figure()
+    if not filas:
+        fig = go.Figure()
+        fig.add_annotation(text="Datos insuficientes para calcular correlaciones", x=0.5, y=0.5, showarrow=False)
+        return fig
+
     df_corr = pd.DataFrame(filas, index=nombres_col).T
     fig = go.Figure(go.Heatmap(
         z=df_corr.values, x=df_corr.columns.tolist(), y=df_corr.index.tolist(),
