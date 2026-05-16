@@ -568,8 +568,9 @@ def pronosticar_con_exogenas_cache(
         return {"error": str(e)}
 
 
-def generar_fechas_futuras(ultima: pd.Timestamp, horizonte: int) -> pd.DatetimeIndex:
-    return pd.date_range(
+def generar_fechas_futuras(ultima: pd.Timestamp, horizonte: int):
+    fechas = pd.date_range(
         start=ultima + pd.DateOffset(months=1),
-        periods=horizonte, freq="MS",
+        periods=horizonte, freq="MS"
     )
+    return [f.to_pydatetime() for f in fechas]   # 🔥 lista de datetimes nativos
